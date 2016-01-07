@@ -1,0 +1,165 @@
+---
+title: "fANOVA"
+author: "Sonia Hugh"
+date: "Monday, June 29, 2015"
+output: html_document
+---
+Testing out the data.
+
+```{r, prelims, echo=FALSE, message=FALSE, results='hide'}
+library(knitr)
+opts_chunk$set(echo=FALSE, message = FALSE, results = "hide")
+library(ggplot2)
+library(ggvis)
+library(plyr)
+library(dplyr)
+library(fda)
+library(reshape2)
+source("E:\\OSU\\Andrews_Forest\\wickham_funct_data_nsf\\func_analysis\\code//utils//fd-utils.R")
+source("E:\\OSU\\Andrews_Forest\\wickham_funct_data_nsf\\func_analysis\\code//utils//glyph.r", chdir = TRUE)
+
+```
+
+You can also embed plots, for example:
+
+```{r, echo=FALSE}
+temps <- tbl(src_sqlite("E:\\OSU\\Andrews_Forest\\wickham_funct_data_nsf\\func_analysis\\andrews.sqlite"), "temps")
+sites <- collect(tbl(src_sqlite("E:\\OSU\\Andrews_Forest\\wickham_funct_data_nsf\\func_analysis\\andrews.sqlite"), "sites"))
+
+# pull out one 24 hour period 7am 9/5/11 -> 7am 9/6/11
+one_day <- collect(filter(temps, YEAR == 2011,((DAY == 5 & HOUR >= 7) | (DAY == 6 & HOUR < 7)), 
+  MONTH == 9)) %>%
+  mutate(time = HOUR + MINUTE/60 + 24*(DAY - 5)) %>%
+  group_by(SITECODE) 
+
+# drop sites without location information
+bad_sites <- unique(anti_join(one_day, sites)$SITECODE)
+one_day <- filter(one_day, !(SITECODE %in% bad_sites)) %>% group_by(SITECODE)
+n_sites <- length(unique(one_day$SITECODE))
+
+# other weird looking sites
+bad_sites <- c(bad_sites, 16, 29, 21, 23) #removed site 21 and 23 because weird in clustering also
+```
+
+```{r, drop-weird-ones}
+one_day <- filter(one_day, !(SITECODE %in% bad_sites)) %>% group_by(SITECODE)
+
+# write.csv(one_day,"E:\\OSU\\Andrews_Forest\\wickham_funct_data_nsf\\func_analysis\\one_day_weird_dropped.csv")
+
+
+#add clusters to one_day
+
+clust.data<-read.csv("E:\\OSU\\Andrews_Forest\\wickham_funct_data_nsf\\func_analysis\\cluster_one_day.csv")
+
+od.clust.match<-match(clust.data$SITECODE, one_day$SITECODE)
+
+one_day$clust<-clust.data$cluster[od.clust.match]
+one_day$clust_type<-clust.data$clust_type[od.clust.match]
+```
+
+
+```{r, represent-as-functions}
+# for now consider sites with 72 measurements
+obs <- group_by(one_day, SITECODE) %>% summarise(n = n(), n_missing = sum(is.na(L2TEMP))) %>% arrange(n) 
+obs # 180 sites
+table(obs$n)
+
+n72 <- filter(obs, n == 72)$SITECODE
+one_day <- filter(one_day, SITECODE %in% n72)
+
+# set up required obs matrices
+one_day <- group_by(one_day, SITECODE) %>% mutate(obs_num = 1:length(L2TEMP))
+
+y <- select(one_day, SITECODE, obs_num, L2TEMP) %>% dcast(obs_num ~ SITECODE)
+t <- select(one_day, SITECODE, obs_num, time) %>% dcast(obs_num ~ SITECODE)
+
+# # checks
+# image(as.matrix(y[, -1])) # seriation??? clustering???
+# image(as.matrix(t[, -1]))
+# apply(t[, -1], 1, function(x) which(x != x[1]))  # sites 217 and 257 have unusual times too?
+
+fs <- create.fourier.basis(range(t[, -1]), 71) 
+```
+
+Smooth data 
+
+```{r, smooth, cache=TRUE}
+# lambdas <- 10^seq(-6, 0, 0.5)
+# gcvs <- llply(lambdas, function(lambda){
+#   smooth.basis(as.matrix(t[, -1]), as.matrix(y[, -1]), fdPar(fs, lambda = lambda))
+# }, .progress = "text")
+# qplot(lambdas, laply(gcvs, "[[", "gcv")) + scale_x_log10()
+# # find minimum but examine smooths and fits as well.
+# # 1e-4 ish
+# l_ply(gcvs, plot)
+
+one_sm <- smooth.basis(as.matrix(t[, -1]), as.matrix(y[, -1]), fdPar(fs, lambda = 1e-04))
+one_sm$fd$fdnames$time <- t[, 2]
+
+one_tempfd<-one_sm$fd
+
+plot(one_tempfd)
+```
+
+
+Test out book example 
+```{r}
+
+
+#  set up the data for the analysis
+
+
+clust.df <-select(one_day, SITECODE, clust)
+
+clust.list<-aggregate(clust~SITECODE,clust.df, mean)
+clust.match<-match(clust.list[,2], one_day$clust)
+clust_type.list<-one_day$clust_type[clust.match]
+names(clust_type.list)<-as.character(clust.list[,1])
+
+
+regions.         = unique(one_day$clust_type)
+p                = length(regions.) + 1
+regionList       = vector("list", p)
+names(regionList)= c('average', as.character(regions.))
+regionList[[1]]  = c(rep(1,161),0)
+for (j in 2:p) {
+  xj             = clust_type.list == regions.[j-1]
+  regionList[[j]]= c(xj,1)
+}
+
+
+
+#Augment the temperature functional data objecct by a 162nd observation
+coef    = one_tempfd$coef
+coef162  = cbind(coef,matrix(0,71,1))
+temp162fd= fd(coef162,fs,one_tempfd$fdnames)
+
+#  set up the regression coefficient list
+
+betabasis      = create.fourier.basis(range(t[, -1]), 9)
+betafdPar      = fdPar(betabasis)
+betaList       = vector("list",p)
+names(betaList)= regions.
+for (j in 1:p) betaList[[j]] = betafdPar
+
+#  carry out the functional analysis of variance
+
+fRegressList= fRegress(temp162fd, regionList, betaList)
+
+#  extract the estimated regression coefficients and y-values
+
+betaestList = fRegressList$betaestlist
+regionFit   = fRegressList$yhatfd
+regions     = c("Average", as.character(regions.))
+
+
+op          = par(mfrow=c(2,3),cex=1)
+for (j in 1:p) plot(betaestList[[j]]$fd, lwd=2,
+                    xlab="hours",
+                    ylab="", main=regions[j])
+plot(regionFit, lwd=2,col= c("red", "blue", "green", "magenta"), lty=1,
+     xlab="hour", ylab="", main="Prediction")
+par(op)
+
+```
+

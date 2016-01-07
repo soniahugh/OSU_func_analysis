@@ -1,0 +1,371 @@
+---
+title: "Exploring one day"
+author: "Charlotte Wickham"
+date: "August 29, 2014"
+output: html_document
+---
+```{r, prelims, echo=FALSE, message=FALSE, results='hide'}
+library(knitr)
+opts_chunk$set(echo=FALSE, message = FALSE, results = "hide")
+library(ggplot2)
+library(ggvis)
+library(plyr)
+library(dplyr)
+library(fda)
+library(reshape2)
+source("code//utils//fd-utils.R")
+source("code//utils//glyph.r", chdir = TRUE)
+```
+## Goal
+
+Demonstrate, using a single day, that the tools of functional data analysis reveal interesting spatial structure in temperature trajectories.
+
+## One clear day in late Summer
+
+```{r, get-data-for-one-day}
+temps <- tbl(src_sqlite("andrews.sqlite"), "temps")
+sites <- collect(tbl(src_sqlite("andrews.sqlite"), "sites"))
+
+# pull out one 24 hour period 7am 9/5/11 -> 7am 9/6/11
+one_day <- collect(filter(temps, YEAR == 2011,((DAY == 5 & HOUR >= 7) | (DAY == 6 & HOUR < 7)), 
+  MONTH == 9)) %>%
+  mutate(time = HOUR + MINUTE/60 + 24*(DAY - 5)) %>%
+  group_by(SITECODE) 
+
+# drop sites without location information
+bad_sites <- unique(anti_join(one_day, sites)$SITECODE)
+one_day <- filter(one_day, !(SITECODE %in% bad_sites)) %>% group_by(SITECODE)
+n_sites <- length(unique(one_day$SITECODE))
+
+# other weird looking sites
+bad_sites <- c(bad_sites, 16, 29)
+```
+As an example, take the 24 hour period from 7am Sep 5 2011 to 7am Sep 6 2011.  The temperature profiles for all `r n_sites` locations are shown below. Mostly, the sites all share the same general shape but there is plenty of variation.  Two sites, 16 and 29 highlighted in orange, seem to have unusual behaviour and  are excluded from further analysis.  Sixteen sites seem to record temperature more frequently that three times an hour, for the purposes of the following functional data analysis, they are excluded (*a restriction of the R package more than anything, could be incorporated with a bit more work*).
+
+```{r, profile-plot, results='asis', fig.height=3, fig.width= 6}
+ggvis(one_day) %>% 
+  layer_paths(x = ~time, y= ~L2TEMP, strokeWidth.hover := 4, strokeWidth := 0.5,
+  stroke = ~ as.character(SITECODE %in% bad_sites )) %>%
+  add_axis("x", title = "Hour", ) %>%
+  add_axis("y", title = "Temperature (C)") %>%
+  hide_legend(c("stroke"))
+
+# ggplot(one_day, aes(time, L2TEMP)) +
+#   geom_line(aes(group = SITECODE, colour = SITECODE %in% bad_sites), size = 0.25, alpha = 0.5) +
+#   scale_colour_manual(values = c("#1F77B4", "#FF7F0E"), guide = "none")  +
+#   xlab("Time") + ylab("Temperature (C)")
+# ggsave("plots/profiles-sep-5-11.pdf", width = 6, height = 4)
+
+# source("code//utils//glyph.r",chdir = TRUE)
+# 
+# # choose 24 hours starting 6am
+# one_day_gly <- glyphs(left_join(one_day, sites), "X", "time", "Y", "L2TEMP", height = 250, width = 250)
+# 
+# glyph map 
+# ggplot(one_day_gly, aes(gx, gy, group = gid)) + 
+#   add_ref_boxes(one_day_gly) +
+#   geom_line() +
+#   coord_equal() +
+#   xlab("") + ylab("") +
+#   ggtitle("Temperature trajectories Sep 5 2011")
+# ggsave("plots/glpyh-sep-5-11.pdf")
+```
+
+```{r, drop-weird-ones}
+one_day <- filter(one_day, !(SITECODE %in% bad_sites)) %>% group_by(SITECODE)
+```
+
+## Functional approach
+
+We consider the temperature trajectories as observation on functions
+\[
+\text{Temperature}_i(t) = f_i(t) + \epsilon_i(t)
+\]
+where $i$ indexes the locations, $t$ is time, $f(t)$ the true (smooth) temperature function and $\epsilon(t)$ the measurement error.  Our first task is estimating the $f_i$.  Here, we fit them using a Fourier basis with a harmonic acceleration penalty, choosing the value of the penalty parameter by minimizing the generalized cross validation score.
+
+*Notes: The Fourier basis with harmonic acceleration penalty is the default choice for periodic data.  I chose it here more for the penalty than a firm belief in periodicity.  These choices deserve much more thought.*
+
+```{r, represent-as-funtions}
+# for now consider sites with 72 measurements
+obs <- group_by(one_day, SITECODE) %>% summarise(n = n(), n_missing = sum(is.na(L2TEMP))) %>% arrange(n) 
+obs # 180 sites
+table(obs$n)
+
+n72 <- filter(obs, n == 72)$SITECODE
+one_day <- filter(one_day, SITECODE %in% n72)
+
+# set up required obs matrices
+one_day <- group_by(one_day, SITECODE) %>% mutate(obs_num = 1:length(L2TEMP))
+
+y <- select(one_day, SITECODE, obs_num, L2TEMP) %>% dcast(obs_num ~ SITECODE)
+t <- select(one_day, SITECODE, obs_num, time) %>% dcast(obs_num ~ SITECODE)
+
+# # checks
+# image(as.matrix(y[, -1])) # seriation??? clustering???
+# image(as.matrix(t[, -1]))
+# apply(t[, -1], 1, function(x) which(x != x[1]))  # sites 217 and 257 have unusual times too?
+
+fs <- create.fourier.basis(range(t[, -1]), 71) 
+```
+
+```{r, smooth, cache=TRUE}
+# lambdas <- 10^seq(-6, 0, 0.5)
+# gcvs <- llply(lambdas, function(lambda){
+#   smooth.basis(as.matrix(t[, -1]), as.matrix(y[, -1]), fdPar(fs, lambda = lambda))
+# }, .progress = "text")
+# qplot(lambdas, laply(gcvs, "[[", "gcv")) + scale_x_log10()
+# # find minimum but examine smooths and fits as well.
+# # 1e-4 ish
+# l_ply(gcvs, plot)
+
+one_sm <- smooth.basis(as.matrix(t[, -1]), as.matrix(y[, -1]), fdPar(fs, lambda = 1e-04))
+one_sm$fd$fdnames$time <- t[, 2]
+```
+The fitted functions for six locations are shown below as lines along with the raw observed values as points. The residual standard error is `r round(sqrt(one_sm$SSE), 2)`, (*Does this seem bigger than measurement error alone? Think of it as lack of fit, investigate later*).
+```{r, show-smooths}
+one_sm_df <- fortify(one_sm$fd)
+one_sm_df <- plyr::rename(one_sm_df, c("rep" = "SITECODE"))
+show_sites <- sample(unique(one_sm_df$SITECODE), size = 6)
+
+filter(one_sm_df, SITECODE %in% show_sites) %>%
+  ggplot() +
+    geom_line(aes(time, value)) +
+  facet_wrap(~ SITECODE) +
+  geom_point(aes(time, L2TEMP), data = filter(one_day, SITECODE %in% show_sites)) +
+  ylab("Temperature (C)")
+```
+
+```{r, fpca}
+one_pcalist <- pca.fd(one_sm$fd, 10)
+```
+
+Functional principal components decomposes the variation in the fitted functions into orthogonal components.  The cumulative percentages of variation explained (in the smoothed functions, not raw data) for the first 10 components are: `r paste(round(cumsum(one_pcalist$varprop), 2), collapse = ", ")`, and we see the first five components explain `r round(cumsum(one_pcalist$varprop), 2)[5]`% of the variation.  These five components are shown below, along with plots of the scores of the locations on these components.
+
+```{r plot-fpca, fig.show='hold', out.width="300px"}
+# pull out harmonics, mean and join
+npcs <- 5
+pcs <- get_pcs(one_pcalist)
+
+scores <- data.frame(one_pcalist$scores)
+names(scores) <- gsub("X", "PC", names(scores))
+scores$SITECODE <- as.integer(names(y)[-1])
+scores <- inner_join(scores, sites)
+
+plot_pc_rels <- function(PC, pc_df, score_df){
+  var_expl <- pc_df[pc_df$rep == PC, "var_explained"][1]
+  var_text <- paste(PC, "\n Variation explained:", 
+    100*round(var_expl, 2), "%")
+  print(ggplot(subset(pc_df, rep == PC), 
+    aes(time, mean)) +
+  geom_line() +
+  geom_line(aes(y = mean + sqrt(eigenvalue)*value), linetype = "dashed") +
+  geom_line(aes(y = mean - sqrt(eigenvalue)*value), linetype = "dotted") +
+  ggtitle(var_text))
+print(ggplot(score_df, aes_string("X", "Y" , colour = PC)) + 
+    geom_point(size = 5) +
+    scale_colour_gradient2()) 
+print(ggplot(score_df, aes_string("Elv", PC)) + 
+    geom_point(size = 3))
+}
+l_ply(c("PC1", "PC2", "PC3", "PC4", "PC5"), plot_pc_rels, pc_df = pcs, score_df = scores)
+```
+
+The first and third components both show quite strong relationships with elevation. The first capturing a difference in the range of temperatures, and the third perhaps a shift in timing. (*With a better choice of colours I now see the first as very strongly spatial, is this just elevation? Or also N versus S facing?*)  The second component seems to be reflecting a level rather than shape variation. This suggests we might be able to capture a lot of the variation by explicitly modelling the temperature profiles as a function of elevation, then we could investigate what variation is left over.  Also of interest are the few high elevation sites that seem to be outliers.
+
+## Explicitly modelling elevation effects
+
+Consider the model
+\[
+f_i(t) = \mu(t) +  Elev_i \beta(t) + \epsilon_i(t)
+\]
+where again $i$ indexes the locations, $t$ is time.  The response of interest is the smooth temperature trajectories and we assume they decompose into a smooth function of time common to all locations, $\mu_i(t)$,and an adjustment to the shape of the trajectory that is linear in the elevation of the location, $Elev_i \beta(t)$. Estimation $\mu(t)$, $\alpha_i$ and $\beta_(t)$ is a functional regression problem. *Lot's of choices in here, bases, smoothness, parameterization...* *How to estimate a location specific constant shift in level, $\alpha_i$?* 
+Actually, after examining fit for above model, refined to:
+\[
+f_i(t) = \mu(t) + Elev_i \beta(t) + Elev_i^2 \gamma(t) + \epsilon_i(t)
+\]
+Predicted temperature trajectories for elevations in steps of 250m are shown below. Interpret? High elevations have smaller range, slower warming, cooling reaches steady state earlier.
+
+*Notes: why do the higher order terms get wigglier despite having the same penalty?*
+```{r, f-regress, fig.show='hold', out.width="450px"}
+elevs <- sites$Elv
+names(elevs) <- sites$SITECODE
+
+x_elevs <- elevs[names(y)[-1]]
+
+beta <- fdPar(fs, lambda = 1)
+const <- create.constant.basis(range(t[, -1]))
+  
+elev_mod <- fRegress(one_sm$fd, 
+  xfdlist = list(rep(1, length(x_elevs)), x_elevs - 900, (x_elevs - 900)^2), 
+  betalist = list(beta, beta, beta))
+
+# plot(elev_mod$betaestlist[[1]]$fd)
+# plot(elev_mod$betaestlist[[2]]$fd)
+# plot(elev_mod$betaestlist[[3]]$fd)
+
+pred_elev_mod <- function(elev){
+  elev_mod$betaestlist[[1]]$fd + (elev - 900)*elev_mod$betaestlist[[2]]$fd + 
+    (elev - 900)^2*elev_mod$betaestlist[[3]]$fd
+}
+
+elevs <- seq(500, 1500, 250)
+names(elevs) <- elevs
+pred_list <- llply(elevs, pred_elev_mod)
+preds <- ldply(pred_list, fortify)
+preds$.id <- factor(preds$.id, 
+  levels = elevs)
+
+ggplot(preds, aes(time, value)) +
+  geom_line(aes(colour = .id, group = .id), size = 1) +
+  scale_colour_manual("Elevation (m)", 
+    values =c("#19334B", "#295172", "#3A719C", "#4B93C9", "#5EB7F8")) +
+  ylab("Predicted temperature")
+
+qplot(x_elevs, xlab = "Elevation (m)")
+```
+
+Time trajectories of the residuals from the elevation model are plotted for each location below in two ways: first each location is a line on common set of axes, second each location is plotted at the spatial coordinates of the location.  *See anything?* Successfully removed a big chunk of variation, but what is left?  Two types in bottom right, those with a dip and those with a hump, do they divide based on N-S facing? 
+
+A couple of high elevation sites at top right and bottom right very poorly fitted.
+
+```{r residual-analysis, fig.width=6, fig.height=3}
+residuals <- elev_mod$yfdPar$fd - predict(elev_mod)$fd
+ggplot(residuals) +
+    geom_line(aes(time, value, group = rep), alpha = 0.4) +
+  ylab("Residual Temperature (C)")
+```
+
+```{r glpyh-residuals, out.width="900px"}
+res_df <- fortify(residuals)
+names(res_df) <- c("time", "SITECODE", "value")
+res_df <- left_join(res_df, sites)
+
+qplot(time, value, 
+  data = subset(res_df, Elv < 1100), 
+  geom = "line",
+  group = SITECODE, alpha  = I(0.5)) +
+  facet_wrap(~ Aspect) +
+  geom_smooth(aes(group = 1))
+# different shape for each aspect, doesn't seem to depend on elevation
+# also fit different level for each location
+
+res_gly <- glyphs(res_df, "X", "time", "Y", "value", height = 250, width = 250)
+
+# glyph map 
+ggplot(res_gly, aes(gx, gy, group = gid)) + 
+  add_ref_boxes(res_gly) +
+  geom_line() +
+  coord_equal()+
+  xlab("") + ylab("") +
+  ggtitle("Residual trajectories from elevation model Sep 5 2011")
+# ggsave(file = "plots/glpyhs-res.pdf")
+```
+
+Functional principal components can be repeated on the residuals.  Major components no longer correspond to elevation effects (i.e. elevation model fits OK), first component reflects change in level, second the hump or dip (relative to elevation model) around 1pm, third the symmetry (?) of the hump/dip. Higher than that seems like noise?
+
+```{r, fpca-residuals, fig.show='hold', out.width="300px"}
+# now take this and do functional PCA
+res_pcalist <- pca.fd(residuals, nharm = 10)
+round(cumsum(res_pcalist$varprop), 2) # about 5 components
+# plot.pca.fd(res_pcalist)
+res_pcs <- get_pcs(res_pcalist)
+
+resscores <- data.frame(res_pcalist$scores)
+names(resscores) <- gsub("X", "PC", names(resscores))
+resscores$SITECODE <- as.integer(names(y)[-1])
+resscores <- left_join(resscores, sites)
+
+l_ply(c("PC1", "PC2", "PC3", "PC4", "PC5"), plot_pc_rels, pc_df = res_pcs, score_df = resscores)
+```
+
+## Extending the elevation model
+
+Examining the PC of the residuals, seems clear to incorporate aspect effects and individual location station levels
+\[
+f_i(t) = \mu(t) + \alpha_i + Elev_i \beta(t) + AspectN_i \delta(t) + \epsilon_i(t)
+\]
+where $AspectN_i$ is an indicator variable taking the value 1 when station $i$ predominantly faces North.
+
+```{r, fRegress2}
+# fitting individual site offsets doesn't work well,
+# so just subtract an average off each site
+one_sm_cent <- one_sm
+one_sm_cent$fd$coefs[1, ] <- 0 # set constant to zero
+
+plot(one_sm_cent)
+plot(one_sm)
+
+const_t <- fd(1, create.constant.basis(range(t[, -1])))
+avg_temps <- inprod(const_t, one_sm$fd) / diff(range(t[, -1]))
+
+site_df <- sites[sites$SITECODE %in% names(y[-1]), ]
+site_df$SITECODE <- factor(site_df$SITECODE)
+site_df$Aspect <- factor(site_df$Aspect)
+site_df$avg_temp <- as.vector(avg_temps)
+
+qplot(X, Y, data = site_df, colour = avg_temp, size = I(5)) +
+  scale_colour_distiller(palette = "Spectral", trans = "reverse")
+qplot(X, Y, data = site_df, colour = Elv, size = I(5)) +
+  scale_colour_distiller(palette = "Spectral", trans = "reverse")
+
+x_mat <- covar_matrix(~ I(Elv - 900) + I((Elv - 900)^2) + Aspect, data = site_df)
+# add contraints
+x_mat_aug <- rbind(x_mat,
+  c(0, 0, 0, 1, 1)
+)
+x_list <- covar_list(x_mat_aug)
+
+#  one extra obs to y
+y_constr <- fd(cbind(one_sm_cent$fd$coefs, matrix(0, one_sm$fd$basis$nbasis, 1)), one_sm$fd$basis)
+
+beta <- fdPar(fs, lambda = 0)
+const <- create.constant.basis(range(t[, -1]))
+  
+elev_asp_mod <- fRegress(y_constr, 
+  xfdlist = x_list, 
+  betalist = rep(c(list(beta)), 5))
+
+# plot predictions
+
+residuals2 <- elev_asp_mod$yfdPar$fd - predict(elev_asp_mod)$fd
+ggplot(residuals2) +
+    geom_line(aes(time, value, group = rep), alpha = 0.4) +
+  ylab("Residual Temperature (C)")
+
+res2_df <- fortify(residuals2)
+names(res2_df) <- c("time", "SITECODE", "value")
+res2_df <- left_join(res2_df, sites)
+
+res2_gly <- glyphs(res2_df, "X", "time", "Y", "value", height = 250, width = 250)
+
+# glyph map 
+ggplot(res2_gly, aes(gx, gy, group = gid)) + 
+  add_ref_boxes(res_gly) +
+  geom_line() +
+  coord_equal()+
+  xlab("") + ylab("") +
+  ggtitle("Residual trajectories from elevation/aspect model Sep 5 2011")
+
+# now take this and do functional PCA
+res2_pcalist <- pca.fd(residuals2, nharm = 10)
+round(cumsum(res2_pcalist$varprop), 2) # about 5 components
+# plot.pca.fd(res_pcalist)
+res2_pcs <- get_pcs(res2_pcalist)
+
+res2scores <- data.frame(res2_pcalist$scores)
+names(res2scores) <- gsub("X", "PC", names(res2scores))
+res2scores$SITECODE <- c(as.integer(names(y)[-1]), 0)
+res2scores <- left_join(res2scores, sites)
+
+l_ply(c("PC1", "PC2", "PC3", "PC4", "PC5"), plot_pc_rels, pc_df = res2_pcs, score_df = res2scores)
+```
+
+Additional thoughts:
+
+* Does additive versus multiplicative make sense?
+
+* How about repeating this on the derivatives?
+
+* Location (x, y) and elevation (z) are describing a  
+2d surface, so any modelled effects of elevation or location can't really be pulled apart.  I.e. the elevation model is probably capturing some location effects too. Probably also some vegetation effects.
+

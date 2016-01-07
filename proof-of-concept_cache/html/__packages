@@ -1,0 +1,17 @@
+base
+methods
+datasets
+utils
+grDevices
+graphics
+stats
+knitr
+ggplot2
+ggvis
+plyr
+dplyr
+splines
+Matrix
+fda
+reshape2
+grid

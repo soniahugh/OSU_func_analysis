@@ -1,0 +1,407 @@
+---
+title: "cluster and fANOVA"
+author: "Sonia Hugh"
+date: "Monday, June 29, 2015"
+output: html_document
+---
+
+First create the cluster data
+
+```{r}
+library(raster)
+library(rgdal)
+
+library(knitr)
+opts_chunk$set(echo=FALSE, message = FALSE, results = "hide")
+library(ggplot2)
+library(ggvis)
+library(plyr)
+library(dplyr)
+library(fda)
+library(reshape2)
+library(RSQLite)
+source("E:\\OSU\\Andrews_Forest\\wickham_funct_data_nsf\\func_analysis\\code//utils//fd-utils.R")
+source("E:\\OSU\\Andrews_Forest\\wickham_funct_data_nsf\\func_analysis\\code//utils//glyph.r", chdir = TRUE)
+source("E:\\OSU\\Andrews_Forest\\wickham_funct_data_nsf\\func_analysis\\cluster_fanova_util.R")
+
+```
+
+
+```{r elevationData}
+
+elevation_25m<-read.csv("E:\\OSU\\Andrews_Forest\\processing\\extract\\25m2\\csv\\elevation25m.csv")
+
+el.in25m<-data.frame(apply(elevation_25m, 2, elevation_index))
+names(el.in25m)<-names(elevation_25m)
+
+el.in25m.t<-t(el.in25m)
+el.in25m.t[is.na(el.in25m.t)] <- 0
+
+elin<-el.in25m.t[-c(18,20,108),]
+
+elin.t<-t(elin)
+
+
+```
+
+
+
+```{r oneDay}
+
+temps <- tbl(src_sqlite("E:\\OSU\\Andrews_Forest\\wickham_funct_data_nsf\\func_analysis\\andrews.sqlite"), "temps")
+sites <- collect(tbl(src_sqlite("E:\\OSU\\Andrews_Forest\\wickham_funct_data_nsf\\func_analysis\\andrews.sqlite"), "sites"))
+
+# pull out one 24 hour period 7am 9/5/11 -> 7am 9/6/11
+one_day <- collect(filter(temps, YEAR == 2011,((DAY == 5 & HOUR >= 7) | (DAY == 6 & HOUR < 7)), 
+  MONTH == 9)) %>%
+  mutate(time = HOUR + MINUTE/60 + 24*(DAY - 5)) %>%
+  group_by(SITECODE) 
+
+# drop sites without location information
+bad_sites <- unique(anti_join(one_day, sites)$SITECODE)
+one_day <- filter(one_day, !(SITECODE %in% bad_sites)) %>% group_by(SITECODE)
+n_sites <- length(unique(one_day$SITECODE))
+
+# other weird looking sites
+bad_sites <- c(bad_sites, 16, 29, 21, 23) #removed site 21 and 23 because weird in clustering also
+one_day <- filter(one_day, !(SITECODE %in% bad_sites)) %>% group_by(SITECODE)
+
+
+
+# one_day<-read.csv("E:\\OSU\\Andrews_Forest\\wickham_funct_data_nsf\\func_analysis\\one_day_weird_dropped.csv")
+
+names(one_day)
+length(unique(one_day$SITECODE))
+
+#Have to get the data for the specific site Charlotte used
+row.list<-gsub("X", "", row.names(el.in25m.t))
+match.row.list<-match(sort(unique(one_day$SITECODE)),as.numeric(row.list))
+
+c.data<-el.in25m.t[match.row.list,]
+
+
+```
+
+```{r cluster3}
+
+rm.pts<-readOGR("E:\\OSU\\Andrews_Forest\\processing\\extract\\hja_veg2008", "hja_veg2008_spatial_join_rm21273")
+pca.el<-princomp(c.data)
+summary(pca.el)
+loadings(pca.el)
+screeplot(pca.el, type = "lines")
+
+#how many clusters
+
+mydata <- c.data
+wss <- (nrow(mydata)-1)*sum(apply(mydata,2,var))
+  for (i in 2:15) wss[i] <- sum(kmeans(mydata,
+                                       centers=i)$withinss)
+plot(1:15, wss, type="b", xlab="Number of Clusters",
+     ylab="Within groups sum of squares")
+
+
+set.seed(10)
+k.el3<-kmeans(c.data, 3)
+library(rgl)
+plot3d(pca.el$scores[,1:3], col=k.el3$cluster)
+
+plot(c.data[,5:6], col=k.el3$cluster)
+test<-cbind(c.data, k.el3$cluster)
+colnames(test)<-c(colnames(elin), "cluster")
+ggplot(as.data.frame(test), aes(test[,1], test[,2],size = 2)) + geom_point(aes(color = factor(cluster)))
+
+#match to rm.pts
+
+row.list<-gsub("X", "", names(k.el3$cluster))
+match.row.list<-match(rm.pts@data$PlotNum,as.numeric(row.list))
+
+rm.pts@data$clust<-k.el3$cluster[match.row.list]
+
+writeOGR(rm.pts,"E:\\OSU\\Andrews_Forest\\processing\\extract\\hja_veg2008", "hja_veg2008_spatial_join_3clust", driver= "ESRI Shapefile", overwrite = TRUE)
+
+bins<-seq(0,80,10)
+k.center<-t(as.data.frame(k.el3$centers))
+
+test<-cbind(bins,k.center)
+clust.data<-melt(as.data.frame(test),id = c("bins"))
+
+p1<- ggplot(clust.data) + geom_line(aes(x=bins, y=value, colour=variable)) +
+  #scale_colour_manual(values=c("red","green","blue", "black"))+
+  ylab("Number of returns")+
+  xlab("elevation bins (m)")+
+  ggtitle("Average elevation Index for clusters")+
+  ylim(0, 25000)+
+  coord_flip()
+
+
+#look at all sites
+elin.t<-t(elin)
+elin.t2<-as.data.frame(cbind(bins,elin.t))
+asites<-melt(elin.t2, id = c('bins'))
+
+p2<- ggplot(asites) + geom_line(aes(x=bins, y=value, colour=variable)) +
+  ylab("Number of returns")+
+  xlab("elevation bins (m)")+
+  ggtitle("Elevation Index for all sites")+
+  ylim(0, 25000)+
+  coord_flip()
+
+multiplot(p1,p2, cols = 2)
+```
+
+```{r cluster8}
+
+rm.pts<-readOGR("E:\\OSU\\Andrews_Forest\\processing\\extract\\hja_veg2008", "hja_veg2008_spatial_join_rm21273")
+pca.el<-princomp(c.data)
+summary(pca.el)
+loadings(pca.el)
+screeplot(pca.el, type = "lines")
+
+#how many clusters
+
+mydata <- c.data
+wss <- (nrow(mydata)-1)*sum(apply(mydata,2,var))
+  for (i in 2:15) wss[i] <- sum(kmeans(mydata,
+                                       centers=i)$withinss)
+plot(1:15, wss, type="b", xlab="Number of Clusters",
+     ylab="Within groups sum of squares")
+
+
+
+k.el8<-kmeans(c.data, 8)
+library(rgl)
+plot3d(pca.el$scores[,1:3], col=k.el8$cluster)
+
+plot(c.data[,5:6], col=k.el8$cluster)
+test<-cbind(c.data, k.el8$cluster)
+colnames(test)<-c(colnames(elin), "cluster")
+ggplot(as.data.frame(test), aes(test[,1], test[,2],size = 2)) + geom_point(aes(color = factor(cluster)))
+
+#match to rm.pts
+
+row.list<-gsub("X", "", names(k.el8$cluster))
+match.row.list<-match(rm.pts@data$PlotNum,as.numeric(row.list))
+
+rm.pts@data$clust<-k.el8$cluster[match.row.list]
+
+writeOGR(rm.pts,"E:\\OSU\\Andrews_Forest\\processing\\extract\\hja_veg2008", "hja_veg2008_spatial_join_8clust", driver= "ESRI Shapefile", overwrite = TRUE)
+
+bins<-seq(0,80,10)
+k.center<-t(as.data.frame(k.el8$centers))
+
+test<-cbind(bins,k.center)
+clust.data<-melt(as.data.frame(test),id = c("bins"))
+
+p3<- ggplot(clust.data) + geom_line(aes(x=bins, y=value, colour=variable)) +
+  #scale_colour_manual(values=c("red","green","blue", "black"))+
+  ylab("Number of returns")+
+  xlab("elevation bins (m)")+
+  ggtitle("Average elevation Index for clusters")+
+  ylim(0, 25000)+
+  coord_flip()
+
+
+#look at all sites
+elin.t<-t(elin)
+elin.t2<-as.data.frame(cbind(bins,elin.t))
+asites<-melt(elin.t2, id = c('bins'))
+
+p2<- ggplot(asites) + geom_line(aes(x=bins, y=value, colour=variable)) +
+  ylab("Number of returns")+
+  xlab("elevation bins (m)")+
+  ggtitle("Elevation Index for all sites")+
+  ylim(0, 25000)+
+  coord_flip()
+
+multiplot(p3,p2, cols = 2)
+```
+
+
+
+
+
+```{r addCluster}
+
+#add 3 cluster data to oneday
+row.list<-gsub("X", "", names(k.el3$cluster))
+match.row.list<-match(one_day$SITECODE,as.numeric(row.list))
+one_day$clust<-k.el3$cluster[match.row.list]
+
+regions = c("Low", "Medium", "High")
+cat.class = cbind(regions, c(2,1,3)) ####****MAKE SURE TO CHANGE ACCORDING TO GRAPH******
+cat.list<-match(one_day$clust,cat.class[,2])
+one_day$clust_type<-cat.class[cat.list,1]
+
+#add 8 cluster data to oneday
+row.list<-gsub("X", "", names(k.el8$cluster))
+match.row.list<-match(one_day$SITECODE,as.numeric(row.list))
+one_day$clust8<-k.el8$cluster[match.row.list]
+
+
+
+```
+
+```{r, represent-as-functions}
+# for now consider sites with 72 measurements
+obs <- group_by(one_day, SITECODE) %>% summarise(n = n(), n_missing = sum(is.na(L2TEMP))) %>% arrange(n) 
+obs # 180 sites
+table(obs$n)
+
+n72 <- filter(obs, n == 72)$SITECODE
+one_day <- filter(one_day, SITECODE %in% n72)
+
+# set up required obs matrices
+one_day <- group_by(one_day, SITECODE) %>% mutate(obs_num = 1:length(L2TEMP))
+
+y <- dplyr::select(one_day, SITECODE, obs_num, L2TEMP) %>% dcast(obs_num ~ SITECODE)
+t <- dplyr::select(one_day, SITECODE, obs_num, time) %>% dcast(obs_num ~ SITECODE)
+
+# # checks
+# image(as.matrix(y[, -1])) # seriation??? clustering???
+# image(as.matrix(t[, -1]))
+# apply(t[, -1], 1, function(x) which(x != x[1]))  # sites 217 and 257 have unusual times too?
+
+fs <- create.fourier.basis(range(t[, -1]), 71) 
+```
+
+```{r, smooth, cache=TRUE}
+# lambdas <- 10^seq(-6, 0, 0.5)
+# gcvs <- llply(lambdas, function(lambda){
+#   smooth.basis(as.matrix(t[, -1]), as.matrix(y[, -1]), fdPar(fs, lambda = lambda))
+# }, .progress = "text")
+# qplot(lambdas, laply(gcvs, "[[", "gcv")) + scale_x_log10()
+# # find minimum but examine smooths and fits as well.
+# # 1e-4 ish
+# l_ply(gcvs, plot)
+
+one_sm <- smooth.basis(as.matrix(t[, -1]), as.matrix(y[, -1]), fdPar(fs, lambda = 1e-04))
+one_sm$fd$fdnames$time <- t[, 2]
+
+one_tempfd<-one_sm$fd
+
+plot(one_tempfd)
+```
+
+
+Test using book example 
+fRegress - create functional parameter object.
+```{r}
+
+
+#  set up the data for the analysis
+
+
+clust.df <-dplyr::select(one_day, SITECODE, clust)
+
+clust.list<-aggregate(clust~SITECODE,clust.df, mean)
+clust.match<-match(clust.list[,2], one_day$clust)
+clust_type.list<-one_day$clust_type[clust.match]
+#names(clust_type.list)<-as.character(clust.list[,1])
+
+
+
+regions.         = unique(one_day$clust_type)
+p                = length(regions.) + 1
+regionList       = vector("list", p)
+names(regionList)= c('average', as.character(regions.))
+regionList[[1]]  = c(rep(1,161),0)
+for (j in 2:p) {
+  xj             = clust_type.list == regions.[j-1]
+  regionList[[j]]= c(xj,1)
+}
+
+
+
+#Augment the temperature functional data objecct by a 162nd observation
+coef    = one_tempfd$coef
+coef162  = cbind(coef,matrix(0,71,1))
+temp162fd= fd(coef162,fs,one_tempfd$fdnames)
+
+#  set up the regression coefficient list
+
+betabasis      = create.fourier.basis(range(t[, -1]), 9)
+betafdPar      = fdPar(betabasis)
+betaList       = vector("list",p)
+names(betaList)= regions.
+for (j in 1:p) betaList[[j]] = betafdPar
+
+#  carry out the functional analysis of variance
+
+fRegressList= fRegress(temp162fd, regionList, betaList)
+
+#  extract the estimated regression coefficients and y-values
+
+betaestList = fRegressList$betaestlist
+regionFit   = fRegressList$yhatfd
+regions     = c("Average", as.character(regions.))
+
+
+op          = par(mfrow=c(2,3),cex=1)
+for (j in 1:p) plot(betaestList[[j]]$fd, lwd=2,
+                    xlab="hours",
+                    ylab="", main=regions[j])
+plot(regionFit,regionFit$argvals, lwd=2, lty=1, xlab="hour", ylab="", main="Prediction")
+par(op)
+
+```
+
+
+```{r fanova8}
+
+
+#  set up the data for the analysis
+
+
+# clust.df <-select(one_day, SITECODE, clust)
+# 
+# clust.list<-aggregate(clust~SITECODE,clust.df, mean)
+# clust.match<-match(clust.list[,2], one_day$clust)
+# clust_type.list<-one_day$clust_type[clust.match]
+# names(clust_type.list)<-as.character(clust.list[,1])
+
+
+
+regions.         = unique(one_day$clust8)
+p                = length(regions.) + 1
+regionList       = vector("list", p)
+names(regionList)= c('average', as.character(regions.))
+regionList[[1]]  = c(rep(1,161),0)
+for (j in 2:p) {
+  xj             = clust_type.list == regions.[j-1]
+  regionList[[j]]= c(xj,1)
+}
+
+
+
+#Augment the temperature functional data objecct by a 162nd observation
+coef    = one_tempfd$coef
+coef162  = cbind(coef,matrix(0,71,1))
+temp162fd= fd(coef162,fs,one_tempfd$fdnames)
+
+#  set up the regression coefficient list
+
+betabasis      = create.fourier.basis(range(t[, -1]), 17)
+betafdPar      = fdPar(betabasis)
+betaList       = vector("list",p)
+names(betaList)= regions.
+for (j in 1:p) betaList[[j]] = betafdPar
+
+#  carry out the functional analysis of variance
+
+fRegressList= fRegress(temp162fd, regionList, betaList)
+
+#  extract the estimated regression coefficients and y-values
+
+betaestList = fRegressList$betaestlist
+regionFit   = fRegressList$yhatfd
+regions     = c("Average", as.character(regions.))
+
+
+op          = par(mfrow=c(2,5),cex=1)
+for (j in 1:p) plot(betaestList[[j]]$fd, lwd=2,
+                    xlab="hours",
+                    ylab="", main=regions[j])
+plot(regionFit,regionFit$argvals, lwd=2, lty=1, xlab="hour", ylab="", main="Prediction")
+par(op)
+
+```
